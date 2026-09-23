@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.zenfoco.commit-wallpaper",
+  "name": "Commit Wallpaper",
+  "version": "1.0.0",
+  "author": "zenfoco",
+  "description": "Live GitHub commit-heatmap wallpaper for Omarchy, themed to match and with twinkling cells",
+  "kinds": ["service"],
+  "entryPoints": { "service": "Service.qml" }
+}

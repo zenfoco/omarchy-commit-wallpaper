@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""Generate a GitHub-style commit-heatmap wallpaper for a GitHub repo
+(omacom/omarchy by default), colored to match the current Omarchy theme.
+
+Run by the Commit Wallpaper shell plugin: periodically to pick up new
+commits, and whenever the background changes so it can follow theme switches
+and step aside when the user picks a different wallpaper."""
+
+import argparse
+import base64
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from xml.sax.saxutils import escape
+
+HOME = os.path.expanduser("~")
+PLUGIN_ID = "io.github.zenfoco.commit-wallpaper"
+CONFIG_PATH = os.path.join(HOME, ".config", "omarchy", "commit-wallpaper.json")
+DEFAULT_REPO = "omacom/omarchy"
+ICON_PATH = "/usr/share/omarchy/icon.png"
+CACHE_DIR = os.path.join(HOME, ".cache", PLUGIN_ID)
+BACKGROUNDS_DIR = os.path.join(HOME, ".config", "omarchy", "backgrounds")
+# Every generated wallpaper starts with this; it is how "ours" is recognized.
+FILE_PREFIX = "commit-wallpaper-"
+# Cell geometry for Service.qml, which animates highlights on top of the PNG.
+CELLS_PATH = os.path.join(CACHE_DIR, "cells.json")
+# Whether we own the background, and what the applied image was built from.
+STATE_PATH = os.path.join(CACHE_DIR, "state.json")
+BACKGROUND_LINK = os.path.join(HOME, ".local", "state", "omarchy", "current", "background")
+# Nerd Font octicons, drawn in JetBrainsMono Nerd Font whatever the UI font is.
+ICON_STAR, ICON_FORK, ICON_EYE = "\uf41e", "\uf402", "\uf441"
+WEEKS = 53
+RECENT = 4
+
+# Per-repo locations, set by configure().
+REPO_SLUG = REPO_URL = REPO_DIR = API_URL = INFO_PATH = None
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"Ignoring {CONFIG_PATH}: {e}", file=sys.stderr)
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def configure(slug):
+    global REPO_SLUG, REPO_URL, REPO_DIR, API_URL, INFO_PATH
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", slug):
+        raise SystemExit(f"Invalid repo '{slug}', expected owner/name")
+    REPO_SLUG = slug
+    REPO_URL = f"https://github.com/{slug}.git"
+    API_URL = f"https://api.github.com/repos/{slug}"
+    base = os.path.join(CACHE_DIR, "repos", slug.replace("/", "__"))
+    REPO_DIR = base
+    # Description / stars / forks / watchers, cached with its ETag so unchanged
+    # polls are 304s that don't count against the unauthenticated rate limit.
+    INFO_PATH = base + ".info.json"
+
+
+def sh(cmd, cwd=None):
+    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def default_branch():
+    return sh(
+        ["git", "-C", REPO_DIR, "symbolic-ref", "refs/remotes/origin/HEAD"]
+    ).strip().rsplit("/", 1)[-1]
+
+
+def ensure_repo():
+    os.makedirs(os.path.dirname(REPO_DIR), exist_ok=True)
+    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        subprocess.run(
+            ["git", "clone", "--filter=blob:none", "--no-checkout", REPO_URL, REPO_DIR],
+            check=True,
+        )
+        return
+    subprocess.run(["git", "-C", REPO_DIR, "remote", "set-url", "origin", REPO_URL], check=True)
+    # Follow upstream if it ever switches its default branch, then fetch only
+    # that branch -- the others are just noise in the journal.
+    subprocess.run(["git", "-C", REPO_DIR, "remote", "set-head", "origin", "--auto"],
+                   check=True, capture_output=True, timeout=60)
+    branch = default_branch()
+    subprocess.run(
+        ["git", "-C", REPO_DIR, "fetch", "-q", "--filter=blob:none", "origin",
+         f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+        check=True, timeout=120,
+    )
+
+
+def try_update_repo():
+    # Polled every few minutes: when offline, keep going with the cached clone
+    # instead of failing on every tick.
+    try:
+        ensure_repo()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+            raise
+        print(f"Fetch failed ({e}); using cached history.", file=sys.stderr)
+
+
+def grid_dates(today, weeks=WEEKS):
+    # Sunday-first columns like GitHub: the grid ends on this week's Saturday.
+    end = today + datetime.timedelta(days=(5 - today.weekday()) % 7)
+    start = end - datetime.timedelta(days=weeks * 7 - 1)
+    return start, end
+
+
+def read_history(since, recent):
+    branch = default_branch()
+    ref = f"origin/{branch}"
+    out = sh(["git", "-C", REPO_DIR, "log", ref, f"--since={since.isoformat()}",
+              "--format=%ad", "--date=short"])
+    counts = {}
+    for day in out.split():
+        counts[day] = counts.get(day, 0) + 1
+
+    # First-parent history is what GitHub lists on the repo page: one entry
+    # per merged PR. Show the PR title instead of "Merge pull request #N from".
+    out = sh(["git", "-C", REPO_DIR, "log", "--first-parent", f"-{recent}", ref,
+              "--format=%h%x1f%an%x1f%at%x1f%s%x1f%b%x1e"])
+    commits = []
+    for rec in out.split("\x1e"):
+        fields = rec.strip("\n").split("\x1f")
+        if len(fields) < 5:
+            continue
+        short, author, ts, subject, body = fields
+        m = re.match(r"Merge pull request #(\d+) from ", subject)
+        if m:
+            title = next((l.strip() for l in body.splitlines() if l.strip()), "")
+            if title:
+                subject = f"{title} (#{m.group(1)})"
+        commits.append({
+            "hash": short,
+            "author": author,
+            "time": datetime.datetime.fromtimestamp(int(ts)),
+            "subject": subject,
+        })
+
+    return {
+        "branch": branch,
+        "head": sh(["git", "-C", REPO_DIR, "rev-parse", ref]).strip(),
+        "counts": counts,
+        "total_all": int(sh(["git", "-C", REPO_DIR, "rev-list", "--count", ref]).strip()),
+        "recent": commits,
+    }
+
+
+def repo_info(fetch=True):
+    try:
+        with open(INFO_PATH) as f:
+            cached = json.load(f)
+    except (OSError, ValueError):
+        cached = {}
+    if not fetch:
+        return cached.get("data")
+    req = urllib.request.Request(API_URL, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": PLUGIN_ID,
+    })
+    if cached.get("etag"):
+        req.add_header("If-None-Match", cached["etag"])
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = json.load(r)
+            cached = {
+                "etag": r.headers.get("ETag"),
+                "data": {
+                    "description": raw.get("description") or "",
+                    "stars": raw.get("stargazers_count", 0),
+                    "forks": raw.get("forks_count", 0),
+                    # watchers_count mirrors stars; subscribers are "watching".
+                    "watching": raw.get("subscribers_count", 0),
+                },
+            }
+            with open(INFO_PATH, "w") as f:
+                json.dump(cached, f)
+    except urllib.error.HTTPError as e:
+        if e.code != 304:
+            print(f"GitHub API: HTTP {e.code}; using cached repo info.", file=sys.stderr)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"GitHub API unreachable ({e}); using cached repo info.", file=sys.stderr)
+    return cached.get("data")
+
+
+def compact(n):
+    # GitHub's sidebar style: 209, 5.0k, 42.8k.
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.1f}m"
+
+
+def load_theme_colors(slug):
+    for base in (
+        os.path.join(HOME, ".config", "omarchy", "themes", slug),
+        os.path.join("/usr/share/omarchy/themes", slug),
+    ):
+        path = os.path.join(base, "colors.toml")
+        if os.path.isfile(path):
+            colors = {}
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and line.split("=", 1)[1].strip().startswith('"'):
+                        key, val = line.split("=", 1)
+                        colors[key.strip()] = val.strip().strip('"')
+            return colors
+    raise SystemExit(f"colors.toml not found for theme '{slug}'")
+
+
+def current_theme_slug():
+    path = os.path.join(HOME, ".local", "state", "omarchy", "current", "theme.name")
+    with open(path) as f:
+        return f.read().strip()
+
+
+def monitor_size():
+    """Pixel size of the focused monitor, or None outside Hyprland."""
+    try:
+        monitors = json.loads(sh(["hyprctl", "monitors", "-j"]))
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return None
+    if not monitors:
+        return None
+    m = next((m for m in monitors if m.get("focused")), monitors[0])
+    w, h = m["width"], m["height"]
+    if m.get("transform", 0) % 2:
+        w, h = h, w
+    return w, h
+
+
+def hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def rgb_to_hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(c))) for c in rgb)
+
+
+def mix(c1, c2, t):
+    a, b = hex_to_rgb(c1), hex_to_rgb(c2)
+    return rgb_to_hex(tuple(a[i] + (b[i] - a[i]) * t for i in range(3)))
+
+
+def themed_icon_base64(accent):
+    if not os.path.isfile(ICON_PATH):
+        return None
+    tinted = os.path.join(CACHE_DIR, "icon-tinted.png")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    subprocess.run(
+        ["magick", ICON_PATH, "-fill", accent, "-colorize", "100", tinted],
+        check=True,
+    )
+    with open(tinted, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
+
+
+def current_streak(counts, today):
+    # Today still counts as "in progress", so an empty today doesn't break it.
+    d = today if counts.get(today.isoformat(), 0) else today - datetime.timedelta(days=1)
+    streak = 0
+    while counts.get(d.isoformat(), 0):
+        streak += 1
+        d -= datetime.timedelta(days=1)
+    return streak
+
+
+def when(t, today):
+    # Absolute-ish on purpose: the image only changes when new commits land,
+    # so "25 minutes ago" would go stale.
+    if t.date() == today:
+        return t.strftime("today %H:%M")
+    if t.date() == today - datetime.timedelta(days=1):
+        return t.strftime("yesterday %H:%M")
+    return t.strftime("%b %-d")
+
+
+def truncate(s, n):
+    return s if len(s) <= n else s[: max(0, n - 1)].rstrip() + "…"
+
+
+def build_svg(hist, colors, width, height, today, weeks=WEEKS):
+    counts = hist["counts"]
+    bg = colors.get("background", "#1a1b26")
+    cell_off = colors.get("lighter_background", colors.get("selection", "#2a2a3a"))
+    accent = colors.get("accent", colors.get("green", "#9ece6a"))
+    fg = colors.get("bright_foreground", colors.get("foreground", "#c0caf5"))
+    fg_dim = colors.get("dark_foreground", colors.get("foreground", "#6b7089"))
+    icon_b64 = themed_icon_base64(accent)
+
+    start, end = grid_dates(today, weeks)
+    days = [start + datetime.timedelta(days=i) for i in range((end - start).days + 1)]
+    values = [counts.get(d.isoformat(), 0) if d <= today else 0 for d in days]
+    nonzero = sorted(v for v in values if v > 0)
+
+    def thresholds():
+        if not nonzero:
+            return [1, 2, 3, 4]
+        def pct(p):
+            idx = min(len(nonzero) - 1, int(len(nonzero) * p))
+            return nonzero[idx]
+        return [1, max(2, pct(0.5)), max(3, pct(0.75)), max(4, pct(0.92))]
+
+    t1, t2, t3, t4 = thresholds()
+
+    def level(v):
+        if v <= 0:
+            return 0
+        if v <= t1:
+            return 1
+        if v <= t2:
+            return 2
+        if v <= t3:
+            return 3
+        return 4
+
+    level_colors = [cell_off] + [mix(bg, accent, t) for t in (0.35, 0.55, 0.78, 1.0)]
+
+    # Layout: weekday labels on the left, month labels on top, an intensity
+    # legend under the grid's right edge, a caption + logo badge below, and
+    # the most recent commits under that.
+    dow_label_w = width * 0.022
+    grid_w = width * 0.78
+    gap = grid_w / weeks * 0.16
+    cell = grid_w / weeks - gap
+    grid_h = cell * 7 + gap * 6
+    radius = cell * 0.24
+    char_w = 0.6  # JetBrains Mono advance width / font size
+
+    recent = hist["recent"]
+    recent_font = cell * 0.72
+    recent_lh = cell * 1.35
+
+    month_label_h = cell * 1.6
+    legend_h = cell * 2.2
+    caption_h = cell * 4.6
+    recent_h = cell * 2.2 + len(recent) * recent_lh
+    block_h = month_label_h + grid_h + legend_h + caption_h + recent_h
+    # Sit slightly above true center (optical center).
+    margin_top = (height - block_h) * 0.44 + month_label_h
+    margin_x = (width - grid_w) / 2 + dow_label_w
+    grid_bottom = margin_top + grid_h
+    grid_right = margin_x + weeks * (cell + gap) - gap
+
+    svg = []
+    svg.append(
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+    )
+    svg.append(f'<rect width="{width}" height="{height}" fill="{bg}"/>')
+
+    # subtle radial glow behind the grid, tinted with accent
+    glow_cy = (margin_top + grid_h / 2) / height * 100
+    svg.append(
+        f'<defs><radialGradient id="glow" cx="50%" cy="{glow_cy:.1f}%" r="65%">'
+        f'<stop offset="0%" stop-color="{accent}" stop-opacity="0.12"/>'
+        f'<stop offset="100%" stop-color="{accent}" stop-opacity="0"/>'
+        f'</radialGradient></defs>'
+    )
+    svg.append(f'<rect width="{width}" height="{height}" fill="url(#glow)"/>')
+
+    # Month labels at the first column whose Sunday falls in a new month;
+    # like GitHub, drop a label that would collide with the next one.
+    labels = []
+    for w in range(weeks):
+        d = start + datetime.timedelta(days=w * 7)
+        if not labels or labels[-1][1] != (d.year, d.month):
+            labels.append((w, (d.year, d.month), d.strftime("%b")))
+    for i, (w, _, name) in enumerate(labels):
+        if i + 1 < len(labels) and labels[i + 1][0] - w < 3:
+            continue
+        x = margin_x + w * (cell + gap)
+        svg.append(
+            f'<text x="{x:.2f}" y="{margin_top - cell*0.9:.2f}" font-family="monospace" '
+            f'font-size="{cell*0.8:.2f}" fill="{fg_dim}">{name}</text>'
+        )
+
+    # Weekday labels (Mon/Wed/Fri), GitHub-style
+    for row, label in ((1, "Mon"), (3, "Wed"), (5, "Fri")):
+        y = margin_top + row * (cell + gap) + cell * 0.78
+        svg.append(
+            f'<text x="{margin_x - dow_label_w*0.6:.2f}" y="{y:.2f}" '
+            f'font-family="monospace" font-size="{cell*0.72:.2f}" fill="{fg_dim}" '
+            f'text-anchor="end">{label}</text>'
+        )
+
+    # Grid cells; columns start on Sunday so row == (weekday + 1) % 7.
+    cells_out = []
+    today_xy = None
+    for i, d in enumerate(days):
+        if d > today:
+            continue
+        x = margin_x + (i // 7) * (cell + gap)
+        y = margin_top + (i % 7) * (cell + gap)
+        lv = level(values[i])
+        svg.append(
+            f'<rect x="{x:.2f}" y="{y:.2f}" width="{cell:.2f}" height="{cell:.2f}" '
+            f'rx="{radius:.2f}" fill="{level_colors[lv]}"/>'
+        )
+        if lv:
+            cells_out.append([round(x, 2), round(y, 2), lv])
+        if d == today:
+            today_xy = [round(x, 2), round(y, 2)]
+
+    # Outline today's cell.
+    if today_xy:
+        pad = gap * 0.55
+        svg.append(
+            f'<rect x="{today_xy[0] - pad:.2f}" y="{today_xy[1] - pad:.2f}" '
+            f'width="{cell + 2*pad:.2f}" height="{cell + 2*pad:.2f}" rx="{radius*1.4:.2f}" '
+            f'fill="none" stroke="{accent}" stroke-width="{gap*0.45:.2f}"/>'
+        )
+
+    # Intensity legend, right-aligned under the grid.
+    leg_cell = cell * 0.8
+    leg_gap = gap
+    leg_font = cell * 0.72
+    leg_y = grid_bottom + legend_h * 0.35
+    x = grid_right - len("More") * leg_font * char_w
+    svg.append(
+        f'<text x="{x:.2f}" y="{leg_y + leg_cell*0.82:.2f}" font-family="monospace" '
+        f'font-size="{leg_font:.2f}" fill="{fg_dim}">More</text>'
+    )
+    x -= leg_gap * 3
+    for lv in range(4, -1, -1):
+        x -= leg_cell
+        svg.append(
+            f'<rect x="{x:.2f}" y="{leg_y:.2f}" width="{leg_cell:.2f}" height="{leg_cell:.2f}" '
+            f'rx="{radius*0.8:.2f}" fill="{level_colors[lv]}"/>'
+        )
+        x -= leg_gap
+    svg.append(
+        f'<text x="{x - leg_gap*2:.2f}" y="{leg_y + leg_cell*0.82:.2f}" font-family="monospace" '
+        f'font-size="{leg_font:.2f}" fill="{fg_dim}" text-anchor="end">Less</text>'
+    )
+
+    # Caption: logo badge + title and stats, centered.
+    total = sum(values)
+    streak = current_streak(counts, today)
+    peak_i = max(range(len(values)), key=lambda i: values[i])
+    stats_parts = [f"{hist['total_all']:,} commits"]
+    if total != hist["total_all"]:  # repos younger than the grid
+        stats_parts.append(f"{total:,} in the last year")
+    if streak:
+        stats_parts.append(f"{streak}-day streak")
+    if values[peak_i]:
+        stats_parts.append(f"peak {values[peak_i]} on {days[peak_i].strftime('%b %-d')}")
+    stats = " · ".join(stats_parts)
+
+    title = REPO_SLUG.split("/", 1)[1]
+    title_size = cell * 1.35
+    stats_size = cell * 0.9
+    info = hist.get("info")
+    description = truncate(info["description"], 60) if info else ""
+    meta = []
+    if info:
+        meta = [(ICON_STAR, f"{compact(info['stars'])} stars"),
+                (ICON_FORK, f"{compact(info['forks'])} forks"),
+                (ICON_EYE, f"{compact(info['watching'])} watching")]
+    meta_len = sum(len(t) + 2 for _, t in meta) + 3 * max(0, len(meta) - 1)
+    text_w = max(
+        len(title) * title_size * char_w + (len(description) + 2) * stats_size * char_w,
+        meta_len * stats_size * char_w,
+        len(stats) * stats_size * char_w,
+    )
+    badge = cell * 3.9
+    badge_gap = cell * 0.9
+    caption_w = badge + badge_gap + text_w
+    block_x = (width - caption_w) / 2
+    cap_top = grid_bottom + legend_h + cell * 0.2
+    text_x = block_x + badge + badge_gap
+
+    if icon_b64:
+        svg.append(
+            f'<image x="{block_x:.2f}" y="{cap_top:.2f}" width="{badge:.2f}" '
+            f'height="{badge:.2f}" href="data:image/png;base64,{icon_b64}"/>'
+        )
+    # Title + repo description, then stars/forks/watching, then commit stats.
+    y = cap_top + title_size * 0.95
+    desc_svg = (f'<tspan dx="{stats_size*char_w*2:.2f}" font-size="{stats_size:.2f}" '
+                f'font-weight="normal" fill="{fg_dim}">{escape(description)}</tspan>') if description else ""
+    svg.append(
+        f'<text x="{text_x:.2f}" y="{y:.2f}" font-family="monospace" '
+        f'font-size="{title_size:.2f}" fill="{fg}" font-weight="bold">{title}{desc_svg}</text>'
+    )
+    if meta:
+        y += stats_size * 1.6
+        spans = " \u00b7 ".join(
+            f'<tspan fill="{accent}" font-family="JetBrainsMono Nerd Font">{icon}</tspan> '
+            f'{escape(text)}' for icon, text in meta
+        )
+        svg.append(
+            f'<text x="{text_x:.2f}" y="{y:.2f}" font-family="monospace" '
+            f'font-size="{stats_size:.2f}" fill="{fg}">{spans}</text>'
+        )
+    y += stats_size * 1.5
+    svg.append(
+        f'<text x="{text_x:.2f}" y="{y:.2f}" '
+        f'font-family="monospace" font-size="{stats_size:.2f}" fill="{fg_dim}">{escape(stats)}</text>'
+    )
+
+    # Recent commits as aligned columns: hash, author, subject, time.
+    if recent:
+        # Same width as the caption block above, left-aligned with the badge.
+        list_w = caption_w
+        list_x = block_x
+        col_char = recent_font * char_w
+        author_len = min(14, max(len(c["author"]) for c in recent))
+        times = [when(c["time"], today) for c in recent]
+        time_len = max(len(t) for t in times)
+        hash_len = max(len(c["hash"]) for c in recent)
+        subject_len = int(list_w / col_char) - hash_len - author_len - time_len - 6
+        list_top = cap_top + caption_h + cell * 1.6
+
+        svg.append(
+            f'<line x1="{list_x:.2f}" y1="{list_top - cell*1.0:.2f}" '
+            f'x2="{list_x + list_w:.2f}" y2="{list_top - cell*1.0:.2f}" '
+            f'stroke="{cell_off}" stroke-width="{gap*0.35:.2f}"/>'
+        )
+        for i, (c, t) in enumerate(zip(recent, times)):
+            y = list_top + i * recent_lh + recent_font * 0.4
+            x_author = list_x + (hash_len + 2) * col_char
+            x_subject = x_author + (author_len + 2) * col_char
+            common = f'y="{y:.2f}" font-family="monospace" font-size="{recent_font:.2f}"'
+            svg.append(f'<text x="{list_x:.2f}" {common} fill="{accent}">{escape(c["hash"])}</text>')
+            svg.append(f'<text x="{x_author:.2f}" {common} fill="{fg}">'
+                       f'{escape(truncate(c["author"], author_len))}</text>')
+            svg.append(f'<text x="{x_subject:.2f}" {common} fill="{fg_dim}">'
+                       f'{escape(truncate(c["subject"], subject_len))}</text>')
+            svg.append(f'<text x="{list_x + list_w:.2f}" {common} fill="{fg_dim}" '
+                       f'text-anchor="end">{escape(t)}</text>')
+
+    svg.append("</svg>")
+
+    geometry = {
+        "width": width,
+        "height": height,
+        "cell": round(cell, 2),
+        "radius": round(radius, 2),
+        "accent": accent,
+        "bright": mix(accent, "#ffffff", 0.45),
+        "today": today_xy,
+        "cells": cells_out,
+    }
+    return "\n".join(svg), geometry
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_PATH)
+
+
+def uninstall():
+    applied = os.path.realpath(BACKGROUND_LINK)
+    removed = 0
+    if os.path.isdir(BACKGROUNDS_DIR):
+        for theme in os.listdir(BACKGROUNDS_DIR):
+            d = os.path.join(BACKGROUNDS_DIR, theme)
+            if not os.path.isdir(d):
+                continue
+            for name in os.listdir(d):
+                if name.startswith(FILE_PREFIX) and name.endswith(".png"):
+                    os.remove(os.path.join(d, name))
+                    removed += 1
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    print(f"Removed {removed} generated wallpaper(s) and {CACHE_DIR}.")
+    if os.path.basename(applied).startswith(FILE_PREFIX):
+        # Falls back to the theme's first background when the current one is gone.
+        subprocess.run(["omarchy-theme-bg-next"], check=False)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--repo", default=None, help=f"owner/name (default: config file, else {DEFAULT_REPO})")
+    ap.add_argument("--theme", default=None, help="Theme slug (default: current theme)")
+    ap.add_argument("--width", type=int, default=None, help="Default: focused monitor, else 1920")
+    ap.add_argument("--height", type=int, default=None, help="Default: focused monitor, else 1080")
+    ap.add_argument("--no-fetch", action="store_true", help="Use cached history and repo info")
+    ap.add_argument("--no-set", action="store_true", help="Only generate, do not apply as background")
+    ap.add_argument("--force", action="store_true",
+                    help="Rebuild and apply even if another wallpaper is set (re-enables it)")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="Delete generated wallpapers and cache, restoring a theme background")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    configure(args.repo or cfg.get("repo") or DEFAULT_REPO)
+    if args.uninstall:
+        return uninstall()
+    recent = max(0, min(10, int(cfg.get("recentCommits", RECENT))))
+
+    slug = args.theme or current_theme_slug()
+    size = monitor_size() or (1920, 1080)
+    width = args.width or size[0]
+    height = args.height or size[1]
+
+    # Decide whether we own the background. A theme switch replaces our image
+    # with the theme's own, so follow it; any other replacement is the user
+    # picking a different wallpaper, so step aside until they pick ours again.
+    applied = os.path.realpath(BACKGROUND_LINK)
+    ours = os.path.basename(applied).startswith(FILE_PREFIX)
+    state = load_state()
+    theme_changed = "theme" in state and state["theme"] != slug
+    if args.force or args.no_set or not state or ours:
+        enabled = True
+    elif theme_changed:
+        enabled = state.get("enabled", False)
+    else:
+        enabled = False
+    if not enabled:
+        if state.get("enabled") or theme_changed:
+            save_state({**state, "enabled": False, "theme": slug})
+        print("Another wallpaper is applied; leaving it alone.")
+        return
+
+    if args.no_fetch and os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        pass
+    elif args.no_fetch:
+        ensure_repo()
+    else:
+        try_update_repo()
+
+    today = datetime.date.today()
+    start, _ = grid_dates(today)
+    hist = read_history(start, recent)
+    hist["info"] = repo_info(fetch=not args.no_fetch)
+    info = hist["info"] or {}
+
+    # Every rebuild replays the shell's background transition, so only rebuild
+    # on a new commit, a new day, or a new theme, size or repo.
+    key = {"repo": REPO_SLUG, "head": hist["head"], "date": today.isoformat(), "theme": slug,
+           "size": [width, height], "recent": recent,
+           # Rounded like on screen, so every new star doesn't force a rebuild.
+           "info": [info.get("description"), compact(info.get("stars", 0)),
+                    compact(info.get("forks", 0)), compact(info.get("watching", 0))]}
+    if not args.force and not args.no_set and ours \
+            and state.get("key") == key and applied == state.get("image"):
+        if not state.get("enabled"):
+            # Picked again from the background selector: resume following it.
+            save_state({**state, "enabled": True, "theme": slug})
+        print("Nothing changed; keeping the current wallpaper.")
+        return
+
+    colors = load_theme_colors(slug)
+    svg, geometry = build_svg(hist, colors, width, height, today)
+
+    # The Omarchy shell's background plugin ignores a `background set` call
+    # whose path is identical to the one already applied (Background.qml
+    # dedupes on finalPath === currentBackground), so overwriting the same
+    # filename in place never triggers a visible update. Use a fresh,
+    # timestamped filename each run and prune the previous ones.
+    out_dir = os.path.join(BACKGROUNDS_DIR, slug)
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    svg_path = os.path.join(CACHE_DIR, "wallpaper.svg")
+    png_path = os.path.join(out_dir, f"{FILE_PREFIX}{stamp}.png")
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(svg_path, "w") as f:
+        f.write(svg)
+
+    subprocess.run(
+        ["rsvg-convert", "-w", str(width), "-h", str(height), svg_path, "-o", png_path],
+        check=True,
+    )
+
+    for old in os.listdir(out_dir):
+        path = os.path.join(out_dir, old)
+        if old.startswith(FILE_PREFIX) and old.endswith(".png") and path != png_path \
+                and not (args.no_set and path == applied):
+            os.remove(path)
+
+    # Written atomically: the shell plugin watches this file.
+    geometry["image"] = png_path
+    tmp = CELLS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(geometry, f)
+    os.replace(tmp, CELLS_PATH)
+
+    print(f"Generated {png_path} ({width}x{height}) for {REPO_SLUG}, theme '{slug}' "
+          f"({hist['total_all']} commits on {hist['branch']})")
+    if args.no_set:
+        return
+
+    if ours and not theme_changed and not args.force:
+        # Refreshing our own image: swap it in place, since the shell's
+        # diagonal reveal on every new commit would be distracting.
+        if os.path.lexists(BACKGROUND_LINK + ".tmp"):
+            os.remove(BACKGROUND_LINK + ".tmp")
+        os.symlink(png_path, BACKGROUND_LINK + ".tmp")
+        os.replace(BACKGROUND_LINK + ".tmp", BACKGROUND_LINK)
+        subprocess.run(["omarchy-shell", "-q", "background", "setInstant", png_path], check=True)
+    else:
+        subprocess.run(["omarchy-theme-bg-set", png_path], check=True)
+    save_state({"enabled": True, "theme": slug, "key": key, "image": png_path})
+    print("Applied as current background.")
+
+
+if __name__ == "__main__":
+    main()
