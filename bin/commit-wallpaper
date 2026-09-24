@@ -8,11 +8,13 @@ and step aside when the user picks a different wallpaper."""
 
 import argparse
 import base64
+import contextlib
 import datetime
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
@@ -49,7 +51,7 @@ QUOTE_ROLE = "Creator of Omarchy"
 GIT_DEADLINE = 300              # seconds for a clone or fetch
 GIT_MAX_BYTES = 512 * 1024**2   # on-disk size of the cached clone
 GIT_MAX_COMMITS = 2_000_000
-API_DEADLINE = 20               # seconds for the whole API request
+API_DEADLINE = 20               # seconds for the whole API request, hard
 API_MAX_BYTES = 1024**2         # the repo JSON is ~6 KB
 # Never let git stop to ask for credentials (private or missing repos).
 GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/true"}
@@ -240,18 +242,38 @@ def read_history(since, recent):
     }
 
 
+class DeadlineExceeded(TimeoutError):
+    pass
+
+
+@contextlib.contextmanager
+def hard_deadline(seconds):
+    """Abort whatever runs inside after `seconds` in total, even a blocking
+    read: socket timeouts only bound each recv, so a peer trickling a byte
+    at a time would otherwise keep a request alive forever. SIGALRM
+    interrupts the read (the generator is single-threaded)."""
+    def expire(signum, frame):
+        raise DeadlineExceeded(f"took longer than {seconds}s")
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def read_capped(r):
-    """Read an HTTP body, rejecting it past API_MAX_BYTES or API_DEADLINE."""
+    """Read an HTTP body, rejecting it past API_MAX_BYTES. The caller bounds
+    the time with hard_deadline()."""
     if int(r.headers.get("Content-Length") or 0) > API_MAX_BYTES:
         raise ValueError(f"response larger than {API_MAX_BYTES} bytes")
-    deadline = time.monotonic() + API_DEADLINE
     chunks, size = [], 0
-    while chunk := r.read(64 * 1024):
+    # read1 returns what has arrived instead of waiting to fill the chunk.
+    while chunk := r.read1(64 * 1024):
         size += len(chunk)
         if size > API_MAX_BYTES:
             raise ValueError(f"response larger than {API_MAX_BYTES} bytes")
-        if time.monotonic() > deadline:
-            raise ValueError(f"response took longer than {API_DEADLINE}s")
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -271,7 +293,8 @@ def repo_info(fetch=True):
     if cached.get("etag"):
         req.add_header("If-None-Match", cached["etag"])
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        # One deadline for connecting, headers and body together.
+        with hard_deadline(API_DEADLINE), urllib.request.urlopen(req, timeout=10) as r:
             raw = json.loads(read_capped(r))
             if not isinstance(raw, dict):
                 raise ValueError("unexpected API response")
