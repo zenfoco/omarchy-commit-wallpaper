@@ -86,9 +86,52 @@ def configure(slug):
     INFO_PATH = base + ".info.json"
 
 
+def kill_group(proc):
+    """Kill a command's whole process group and wait until it is empty. Git
+    hands transfers to helper processes (git-remote-https, index-pack) that
+    outlive a killed parent and keep writing; they all share the group the
+    command was started in (start_new_session), so they go together."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    # Orphaned helpers stay in the group until they're gone.
+    for _ in range(200):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    raise RuntimeError(f"{proc.args[0]} left processes behind")
+
+
+def run(cmd, timeout, cwd=None):
+    """subprocess.run with check=True, in its own process group, whose
+    every member is killed on timeout (and reaped either way)."""
+    proc = subprocess.Popen(cmd, cwd=cwd, env=GIT_ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    finally:
+        kill_group(proc)
+    if proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, out, err)
+    return out
+
+
 def sh(cmd, cwd=None):
-    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True,
-                          env=GIT_ENV, timeout=60).stdout
+    return run(cmd, 60, cwd=cwd)
+
+
+def quiet(cmd, timeout):
+    """Best effort (rollback chores): same process-group handling, errors ignored."""
+    try:
+        run(cmd, timeout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def dir_size(path):
@@ -103,9 +146,9 @@ def dir_size(path):
 
 
 def bounded_git(cmd, watch_dir):
-    """Run a git transfer, killing it past GIT_DEADLINE or once watch_dir
-    grows beyond GIT_MAX_BYTES."""
-    proc = subprocess.Popen(cmd, env=GIT_ENV, stdin=subprocess.DEVNULL)
+    """Run a git transfer, killing it (with every helper process) past
+    GIT_DEADLINE or once watch_dir grows beyond GIT_MAX_BYTES."""
+    proc = subprocess.Popen(cmd, env=GIT_ENV, stdin=subprocess.DEVNULL, start_new_session=True)
     deadline = time.monotonic() + GIT_DEADLINE
     try:
         while True:
@@ -119,9 +162,9 @@ def bounded_git(cmd, watch_dir):
             if dir_size(watch_dir) > GIT_MAX_BYTES:
                 raise RepoTooLarge(f"{REPO_SLUG} exceeds {GIT_MAX_BYTES // 1024**2} MB")
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
+        # Always, even after a clean exit: nothing of the transfer may still
+        # be writing when the caller checks sizes or deletes the staging dir.
+        kill_group(proc)
     if rc:
         raise subprocess.CalledProcessError(rc, cmd)
 
@@ -173,14 +216,13 @@ def ensure_repo():
         check_repo_limits(REPO_DIR)
     except BaseException:
         # Roll back to the last known-good history and drop what was fetched.
-        subprocess.run(["git", "-C", REPO_DIR, "update-ref", ref, known_good],
-                       env=GIT_ENV, capture_output=True, timeout=60)
+        quiet(["git", "-C", REPO_DIR, "update-ref", ref, known_good], 60)
         pack_dir = os.path.join(REPO_DIR, ".git", "objects", "pack")
         for name in os.listdir(pack_dir):
             if name.startswith("tmp_"):
                 os.remove(os.path.join(pack_dir, name))
         for cmd in (["reflog", "expire", "--expire=now", "--all"], ["gc", "-q", "--prune=now"]):
-            subprocess.run(["git", "-C", REPO_DIR, *cmd], env=GIT_ENV, capture_output=True, timeout=120)
+            quiet(["git", "-C", REPO_DIR, *cmd], 120)
         raise
 
 
@@ -387,7 +429,7 @@ def themed_icon_base64(accent):
     os.makedirs(CACHE_DIR, exist_ok=True)
     subprocess.run(
         ["magick", ICON_PATH, "-fill", accent, "-colorize", "100", tinted],
-        check=True,
+        check=True, timeout=60,
     )
     with open(tinted, "rb") as f:
         return base64.b64encode(f.read()).decode("ascii")
