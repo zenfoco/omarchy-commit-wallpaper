@@ -13,6 +13,7 @@ import datetime
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -53,6 +54,8 @@ GIT_MAX_BYTES = 512 * 1024**2   # on-disk size of the cached clone
 GIT_MAX_COMMITS = 2_000_000
 API_DEADLINE = 20               # seconds for the whole API request, hard
 API_MAX_BYTES = 1024**2         # the repo JSON is ~6 KB
+GIT_MAX_OUTPUT = 1024**2        # what a git command may print for us to keep
+GIT_MAX_STREAM = 64 * 1024**2   # what the heatmap query may stream (not kept)
 # Never let git stop to ask for credentials (private or missing repos).
 GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/true"}
 
@@ -106,20 +109,56 @@ def kill_group(proc):
     raise RuntimeError(f"{proc.args[0]} left processes behind")
 
 
-def run(cmd, timeout, cwd=None):
-    """subprocess.run with check=True, in its own process group, whose
-    every member is killed on timeout (and reaped either way)."""
+class OutputTooLarge(Exception):
+    pass
+
+
+def stream(cmd, timeout, sink, cwd=None):
+    """Run a command in its own process group and hand its stdout to
+    sink(chunk) as it arrives, within one total deadline. stderr is kept up
+    to 64 KB for the error message. The group is killed and reaped on every
+    path, so a sink that raises (too much output) stops the command too."""
     proc = subprocess.Popen(cmd, cwd=cwd, env=GIT_ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+                            stderr=subprocess.PIPE, start_new_session=True)
+    deadline = time.monotonic() + timeout
+    err = bytearray()
     try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise subprocess.TimeoutExpired(cmd, timeout)
+        fds = {proc.stdout.fileno(): True, proc.stderr.fileno(): False}
+        while fds:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            ready, _, _ = select.select(list(fds), [], [], left)
+            for fd in ready:
+                chunk = os.read(fd, 64 * 1024)
+                if not chunk:
+                    del fds[fd]
+                elif fds[fd]:
+                    sink(chunk)
+                elif len(err) < 64 * 1024:
+                    err += chunk[:64 * 1024 - len(err)]
+        rc = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
     finally:
         kill_group(proc)
-    if proc.returncode:
-        raise subprocess.CalledProcessError(proc.returncode, cmd, out, err)
-    return out
+        proc.stdout.close()
+        proc.stderr.close()
+    if rc:
+        raise subprocess.CalledProcessError(rc, cmd, None, err.decode("utf-8", "replace"))
+
+
+def run(cmd, timeout, cwd=None, max_bytes=GIT_MAX_OUTPUT):
+    """subprocess.run(check=True) with a process group killed on timeout and
+    stdout capped at max_bytes: past it the command is killed and
+    OutputTooLarge raised, instead of buffering whatever it prints."""
+    buf = bytearray()
+
+    def keep(chunk):
+        buf.extend(chunk)
+        if len(buf) > max_bytes:
+            raise OutputTooLarge(f"{cmd[0]} printed more than {max_bytes} bytes")
+
+    stream(cmd, timeout, keep, cwd=cwd)
+    return buf.decode("utf-8", "replace")
 
 
 def sh(cmd, cwd=None):
@@ -130,7 +169,7 @@ def quiet(cmd, timeout):
     """Best effort (rollback chores): same process-group handling, errors ignored."""
     try:
         run(cmd, timeout)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OutputTooLarge, OSError):
         pass
 
 
@@ -231,7 +270,7 @@ def try_update_repo():
     # instead of failing on every tick.
     try:
         ensure_repo()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RepoTooLarge) as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RepoTooLarge, OutputTooLarge) as e:
         if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
             raise SystemExit(f"Could not clone {REPO_SLUG}: {e}")
         print(f"Fetch failed ({e}); using cached history.", file=sys.stderr)
@@ -244,28 +283,45 @@ def grid_dates(today, weeks=WEEKS):
     return start, end
 
 
-def read_history(since, recent):
+def read_history(since, until, recent):
     branch = default_branch()
     ref = f"origin/{branch}"
-    out = sh(["git", "-C", REPO_DIR, "log", ref, f"--since={since.isoformat()}",
-              "--format=%ad", "--date=short"])
-    counts = {}
-    for day in out.split():
-        counts[day] = counts.get(day, 0) + 1
+
+    # Commits per day, counted as git streams them: nothing but the counts is
+    # kept, and only days on the grid (commit dates are the author's word).
+    first, last = since.isoformat(), until.isoformat()
+    counts, carry, streamed = {}, b"", 0
+
+    def count(chunk):
+        nonlocal carry, streamed
+        streamed += len(chunk)
+        if streamed > GIT_MAX_STREAM:
+            raise OutputTooLarge(f"git log printed more than {GIT_MAX_STREAM} bytes")
+        lines = (carry + chunk).split(b"\n")
+        carry = lines.pop()
+        if len(carry) > 32:
+            raise OutputTooLarge("unexpected git log output")
+        for raw in lines:
+            day = raw.decode("ascii", "replace")
+            if first <= day <= last:
+                counts[day] = counts.get(day, 0) + 1
+
+    stream(["git", "-C", REPO_DIR, "log", ref, f"--since={first}", "--format=%ad", "--date=short"], 120, count)
 
     # First-parent history is what GitHub lists on the repo page: one entry
-    # per merged PR. Show the PR title instead of "Merge pull request #N from".
+    # per merged PR. Names and subjects come back truncated by git itself,
+    # and no commit bodies: those are fetched one by one below, capped.
     out = sh(["git", "-C", REPO_DIR, "log", "--first-parent", f"-{recent}", ref,
-              "--format=%h%x1f%an%x1f%at%x1f%s%x1f%b%x1e"])
+              "--format=%H%x1f%h%x1f%<(40,trunc)%an%x1f%at%x1f%<(200,trunc)%s%x1e"])
     commits = []
     for rec in out.split("\x1e"):
         fields = rec.strip("\n").split("\x1f")
         if len(fields) < 5:
             continue
-        short, author, ts, subject, body = fields
+        full, short, author, ts, subject = (f.strip() for f in fields)
         m = re.match(r"Merge pull request #(\d+) from ", subject)
         if m:
-            title = next((l.strip() for l in body.splitlines() if l.strip()), "")
+            title = pr_title(full)
             if title:
                 subject = f"{title} (#{m.group(1)})"
         commits.append({
@@ -282,6 +338,16 @@ def read_history(since, recent):
         "total_all": int(sh(["git", "-C", REPO_DIR, "rev-list", "--count", ref]).strip()),
         "recent": commits,
     }
+
+
+def pr_title(commit):
+    """First line of a merge commit's body (GitHub puts the PR title there),
+    or "" if there's none or the body is unreasonably large."""
+    try:
+        body = run(["git", "-C", REPO_DIR, "log", "-1", "--format=%b", commit], 60, max_bytes=16 * 1024)
+    except OutputTooLarge:
+        return ""
+    return next((l.strip() for l in body.splitlines() if l.strip()), "")[:200]
 
 
 class DeadlineExceeded(TimeoutError):
@@ -834,8 +900,8 @@ def main():
         try_update_repo()
 
     today = datetime.date.today()
-    start, _ = grid_dates(today)
-    hist = read_history(start, recent)
+    start, end = grid_dates(today)
+    hist = read_history(start, end, recent)
     hist["info"] = repo_info(fetch=not args.no_fetch)
     info = hist["info"] or {}
 
