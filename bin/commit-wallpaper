@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from xml.sax.saxutils import escape
@@ -37,6 +38,15 @@ BACKGROUND_LINK = os.path.join(HOME, ".local", "state", "omarchy", "current", "b
 ICON_STAR, ICON_FORK, ICON_EYE = "\uf41e", "\uf402", "\uf441"
 WEEKS = 53
 RECENT = 4
+# Hard ceilings on remote data, since the repo is user-configurable. The clone
+# only holds commits (no trees or blobs): omacom/omarchy takes ~3 MB.
+GIT_DEADLINE = 300              # seconds for a clone or fetch
+GIT_MAX_BYTES = 512 * 1024**2   # on-disk size of the cached clone
+GIT_MAX_COMMITS = 2_000_000
+API_DEADLINE = 20               # seconds for the whole API request
+API_MAX_BYTES = 1024**2         # the repo JSON is ~6 KB
+# Never let git stop to ask for credentials (private or missing repos).
+GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/true"}
 
 # Per-repo locations, set by configure().
 REPO_SLUG = REPO_URL = REPO_DIR = API_URL = INFO_PATH = None
@@ -69,7 +79,56 @@ def configure(slug):
 
 
 def sh(cmd, cwd=None):
-    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True).stdout
+    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True,
+                          env=GIT_ENV, timeout=60).stdout
+
+
+def dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def bounded_git(cmd, watch_dir):
+    """Run a git transfer, killing it past GIT_DEADLINE or once watch_dir
+    grows beyond GIT_MAX_BYTES."""
+    proc = subprocess.Popen(cmd, env=GIT_ENV, stdin=subprocess.DEVNULL)
+    deadline = time.monotonic() + GIT_DEADLINE
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if time.monotonic() > deadline:
+                raise subprocess.TimeoutExpired(cmd, GIT_DEADLINE)
+            if dir_size(watch_dir) > GIT_MAX_BYTES:
+                raise RepoTooLarge(f"{REPO_SLUG} exceeds {GIT_MAX_BYTES // 1024**2} MB")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    if rc:
+        raise subprocess.CalledProcessError(rc, cmd)
+
+
+class RepoTooLarge(Exception):
+    pass
+
+
+def check_repo_limits(path):
+    if dir_size(path) > GIT_MAX_BYTES:
+        raise RepoTooLarge(f"{REPO_SLUG} exceeds {GIT_MAX_BYTES // 1024**2} MB")
+    ref = sh(["git", "-C", path, "symbolic-ref", "refs/remotes/origin/HEAD"]).strip()
+    count = int(sh(["git", "-C", path, "rev-list", "--count", ref]).strip())
+    if count > GIT_MAX_COMMITS:
+        raise RepoTooLarge(f"{REPO_SLUG} has {count:,} commits (limit {GIT_MAX_COMMITS:,})")
 
 
 def default_branch():
@@ -81,22 +140,40 @@ def default_branch():
 def ensure_repo():
     os.makedirs(os.path.dirname(REPO_DIR), exist_ok=True)
     if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
-        subprocess.run(
-            ["git", "clone", "--filter=blob:none", "--no-checkout", REPO_URL, REPO_DIR],
-            check=True,
-        )
+        # Clone into a staging dir and only move it into place once it is
+        # complete and within limits, so a failed clone leaves nothing behind.
+        staging = REPO_DIR + ".partial"
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            bounded_git(["git", "clone", "-q", "--filter=tree:0", "--no-checkout",
+                         "--single-branch", REPO_URL, staging], staging)
+            check_repo_limits(staging)
+            os.rename(staging, REPO_DIR)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
         return
-    subprocess.run(["git", "-C", REPO_DIR, "remote", "set-url", "origin", REPO_URL], check=True)
+    sh(["git", "-C", REPO_DIR, "remote", "set-url", "origin", REPO_URL])
     # Follow upstream if it ever switches its default branch, then fetch only
     # that branch -- the others are just noise in the journal.
-    subprocess.run(["git", "-C", REPO_DIR, "remote", "set-head", "origin", "--auto"],
-                   check=True, capture_output=True, timeout=60)
+    sh(["git", "-C", REPO_DIR, "remote", "set-head", "origin", "--auto"])
     branch = default_branch()
-    subprocess.run(
-        ["git", "-C", REPO_DIR, "fetch", "-q", "--filter=blob:none", "origin",
-         f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
-        check=True, timeout=120,
-    )
+    ref = f"refs/remotes/origin/{branch}"
+    known_good = sh(["git", "-C", REPO_DIR, "rev-parse", ref]).strip()
+    try:
+        bounded_git(["git", "-C", REPO_DIR, "fetch", "-q", "--filter=tree:0", "origin",
+                     f"+refs/heads/{branch}:{ref}"], REPO_DIR)
+        check_repo_limits(REPO_DIR)
+    except BaseException:
+        # Roll back to the last known-good history and drop what was fetched.
+        subprocess.run(["git", "-C", REPO_DIR, "update-ref", ref, known_good],
+                       env=GIT_ENV, capture_output=True, timeout=60)
+        pack_dir = os.path.join(REPO_DIR, ".git", "objects", "pack")
+        for name in os.listdir(pack_dir):
+            if name.startswith("tmp_"):
+                os.remove(os.path.join(pack_dir, name))
+        for cmd in (["reflog", "expire", "--expire=now", "--all"], ["gc", "-q", "--prune=now"]):
+            subprocess.run(["git", "-C", REPO_DIR, *cmd], env=GIT_ENV, capture_output=True, timeout=120)
+        raise
 
 
 def try_update_repo():
@@ -104,9 +181,9 @@ def try_update_repo():
     # instead of failing on every tick.
     try:
         ensure_repo()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RepoTooLarge) as e:
         if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
-            raise
+            raise SystemExit(f"Could not clone {REPO_SLUG}: {e}")
         print(f"Fetch failed ({e}); using cached history.", file=sys.stderr)
 
 
@@ -157,6 +234,22 @@ def read_history(since, recent):
     }
 
 
+def read_capped(r):
+    """Read an HTTP body, rejecting it past API_MAX_BYTES or API_DEADLINE."""
+    if int(r.headers.get("Content-Length") or 0) > API_MAX_BYTES:
+        raise ValueError(f"response larger than {API_MAX_BYTES} bytes")
+    deadline = time.monotonic() + API_DEADLINE
+    chunks, size = [], 0
+    while chunk := r.read(64 * 1024):
+        size += len(chunk)
+        if size > API_MAX_BYTES:
+            raise ValueError(f"response larger than {API_MAX_BYTES} bytes")
+        if time.monotonic() > deadline:
+            raise ValueError(f"response took longer than {API_DEADLINE}s")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def repo_info(fetch=True):
     try:
         with open(INFO_PATH) as f:
@@ -172,8 +265,10 @@ def repo_info(fetch=True):
     if cached.get("etag"):
         req.add_header("If-None-Match", cached["etag"])
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            raw = json.load(r)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = json.loads(read_capped(r))
+            if not isinstance(raw, dict):
+                raise ValueError("unexpected API response")
             cached = {
                 "etag": r.headers.get("ETag"),
                 "data": {
@@ -638,11 +733,7 @@ def main():
         print("Another wallpaper is applied; leaving it alone.")
         return
 
-    if args.no_fetch and os.path.isdir(os.path.join(REPO_DIR, ".git")):
-        pass
-    elif args.no_fetch:
-        ensure_repo()
-    else:
+    if not (args.no_fetch and os.path.isdir(os.path.join(REPO_DIR, ".git"))):
         try_update_repo()
 
     today = datetime.date.today()
@@ -686,7 +777,7 @@ def main():
 
     subprocess.run(
         ["rsvg-convert", "-w", str(width), "-h", str(height), svg_path, "-o", png_path],
-        check=True,
+        check=True, timeout=60,
     )
 
     for old in os.listdir(out_dir):

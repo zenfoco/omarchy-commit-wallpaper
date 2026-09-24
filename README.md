@@ -49,10 +49,12 @@ Changes are picked up automatically.
 
 The plugin is a shell `service` with two parts:
 
-- `bin/commit-wallpaper` (Python, standard library only) keeps a blobless clone of the repo in `~/.cache/io.github.zenfoco.commit-wallpaper/`, reads the commit history, fetches the repo stats from the public GitHub API, renders an SVG with `rsvg-convert`, and applies the PNG with `omarchy-theme-bg-set`.
+- `bin/commit-wallpaper` (Python, standard library only) keeps a commits-only clone of the repo (no trees or blobs) in `~/.cache/io.github.zenfoco.commit-wallpaper/`, reads the commit history, fetches the repo stats from the public GitHub API, renders an SVG with `rsvg-convert`, and applies the PNG with `omarchy-theme-bg-set`.
 - `Service.qml` runs the generator on a timer and whenever the background changes. It also draws the animated highlights on a click-through layer above the wallpaper, using the cell positions the generator writes out.
 
 Each check does a single-branch `git fetch` and one conditional API request. An unchanged API response returns `304 Not Modified`, which doesn't count against GitHub's rate limit. The image is only rebuilt when something visible changes. Stars and forks are rounded the way GitHub shows them (`42.8k`), so a new star doesn't trigger a rebuild. When you're offline, the cached data is used.
+
+Remote data is capped, since the repo is configurable: a clone or fetch is killed after 5 minutes or once the cache passes 512 MB (or 2 million commits), and the API response is limited to 1 MB. A failed first clone leaves nothing behind, and a rejected fetch rolls back to the last good history.
 
 Network access: `github.com` (git) and `api.github.com` (repo stats). No tokens, no telemetry. Nothing needs root.
 
