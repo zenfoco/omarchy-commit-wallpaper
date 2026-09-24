@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -38,6 +39,11 @@ BACKGROUND_LINK = os.path.join(HOME, ".local", "state", "omarchy", "current", "b
 ICON_STAR, ICON_FORK, ICON_EYE = "\uf41e", "\uf402", "\uf441"
 WEEKS = 53
 RECENT = 4
+# Closes the composition, under the recent commits ("quote": false hides it).
+QUOTE = ("When you can vibe code whatever app comes to your mind, "
+         "you should be able to vibe code your operating system.")
+QUOTE_AUTHOR = "David Heinemeier Hansson"
+QUOTE_ROLE = "Creator of Omarchy"
 # Hard ceilings on remote data, since the repo is user-configurable. The clone
 # only holds commits (no trees or blobs): omacom/omarchy takes ~3 MB.
 GIT_DEADLINE = 300              # seconds for a clone or fetch
@@ -388,7 +394,7 @@ def truncate(s, n):
     return s if len(s) <= n else s[: max(0, n - 1)].rstrip() + "…"
 
 
-def build_svg(hist, colors, width, height, today, weeks=WEEKS):
+def build_svg(hist, colors, width, height, today, weeks=WEEKS, quote=True):
     counts = hist["counts"]
     bg = colors.get("background", "#1a1b26")
     cell_off = colors.get("lighter_background", colors.get("selection", "#2a2a3a"))
@@ -427,7 +433,7 @@ def build_svg(hist, colors, width, height, today, weeks=WEEKS):
 
     # Layout: weekday labels on the left, month labels on top, an intensity
     # legend under the grid's right edge, a caption + logo badge below, and
-    # the most recent commits under that.
+    # the most recent commits under that, and the quote closing it.
     dow_label_w = width * 0.022
     grid_w = width * 0.78
     gap = grid_w / weeks * 0.16
@@ -444,7 +450,14 @@ def build_svg(hist, colors, width, height, today, weeks=WEEKS):
     legend_h = cell * 2.2
     caption_h = cell * 4.6
     recent_h = cell * 2.2 + len(recent) * recent_lh
-    block_h = month_label_h + grid_h + legend_h + caption_h + recent_h
+
+    quote_font = cell * 0.9
+    quote_lh = quote_font * 1.55
+    # Wrapped to about two thirds of the grid, and centered on its own.
+    quote_cols = max(20, int(grid_w * 0.66 / (quote_font * char_w)))
+    quote_lines = textwrap.wrap(QUOTE, quote_cols) if quote else []
+    quote_h = (cell * 2.6 + len(quote_lines) * quote_lh + cell * 2.2) if quote_lines else 0
+    block_h = month_label_h + grid_h + legend_h + caption_h + recent_h + quote_h
     # Sit slightly above true center (optical center).
     margin_top = (height - block_h) * 0.44 + month_label_h
     margin_x = (width - grid_w) / 2 + dow_label_w
@@ -639,6 +652,24 @@ def build_svg(hist, colors, width, height, today, weeks=WEEKS):
             svg.append(f'<text x="{list_x + list_w:.2f}" {common} fill="{fg_dim}" '
                        f'text-anchor="end">{escape(t)}</text>')
 
+    # The quote: a big accent mark in the gutter, italic lines, attribution.
+    if quote_lines:
+        top = (cap_top + caption_h + cell * 1.6 + len(recent) * recent_lh) if recent else (cap_top + caption_h)
+        top += cell * 2.6
+        indent = quote_font * 1.6
+        quote_x = (width - indent - max(len(l) for l in quote_lines) * quote_font * char_w) / 2
+        svg.append(f'<text x="{quote_x:.2f}" y="{top + quote_font * 1.25:.2f}" font-family="serif" '
+                   f'font-size="{quote_font * 3.2:.2f}" fill="{accent}" opacity="0.85">\u201c</text>')
+        for i, line in enumerate(quote_lines):
+            svg.append(f'<text x="{quote_x + indent:.2f}" y="{top + quote_font + i * quote_lh:.2f}" '
+                       f'font-family="monospace" font-style="italic" font-size="{quote_font:.2f}" '
+                       f'fill="{fg}">{escape(line)}</text>')
+        y = top + quote_font + len(quote_lines) * quote_lh + cell * 0.6
+        svg.append(f'<text x="{quote_x + indent:.2f}" y="{y:.2f}" font-family="monospace" '
+                   f'font-size="{quote_font * 0.8:.2f}" fill="{fg_dim}">'
+                   f'<tspan fill="{accent}">\u2014</tspan> {escape(QUOTE_AUTHOR)}'
+                   f'<tspan dx="{quote_font * char_w:.2f}">\u00b7 {escape(QUOTE_ROLE)}</tspan></text>')
+
     svg.append("</svg>")
 
     geometry = {
@@ -708,6 +739,7 @@ def main():
     if args.uninstall:
         return uninstall()
     recent = max(0, min(10, int(cfg.get("recentCommits", RECENT))))
+    quote = cfg.get("quote", True) is not False
 
     slug = args.theme or current_theme_slug()
     size = monitor_size() or (1920, 1080)
@@ -745,7 +777,7 @@ def main():
     # Every rebuild replays the shell's background transition, so only rebuild
     # on a new commit, a new day, or a new theme, size or repo.
     key = {"repo": REPO_SLUG, "head": hist["head"], "date": today.isoformat(), "theme": slug,
-           "size": [width, height], "recent": recent,
+           "size": [width, height], "recent": recent, "quote": quote,
            # Rounded like on screen, so every new star doesn't force a rebuild.
            "info": [info.get("description"), compact(info.get("stars", 0)),
                     compact(info.get("forks", 0)), compact(info.get("watching", 0))]}
@@ -758,7 +790,7 @@ def main():
         return
 
     colors = load_theme_colors(slug)
-    svg, geometry = build_svg(hist, colors, width, height, today)
+    svg, geometry = build_svg(hist, colors, width, height, today, quote=quote)
 
     # The Omarchy shell's background plugin ignores a `background set` call
     # whose path is identical to the one already applied (Background.qml

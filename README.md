@@ -32,7 +32,8 @@ All settings are optional. Create `~/.config/omarchy/commit-wallpaper.json`:
   "repo": "omacom/omarchy",
   "refreshMinutes": 5,
   "recentCommits": 4,
-  "sparks": 10
+  "sparks": 10,
+  "quote": true
 }
 ```
 
@@ -42,6 +43,7 @@ All settings are optional. Create `~/.config/omarchy/commit-wallpaper.json`:
 | `refreshMinutes` | `5` | How often to check for new commits and repo stats |
 | `recentCommits` | `4` | Recent commits listed under the graph (0 to 10) |
 | `sparks` | `10` | Cells twinkling at the same time (0 turns the animation off) |
+| `quote` | `true` | Show DHH's quote about vibe coding your operating system under the commits |
 
 Changes are picked up automatically.
 
